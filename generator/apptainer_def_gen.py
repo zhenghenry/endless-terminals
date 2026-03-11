@@ -87,10 +87,14 @@ def build_and_test(def_template: str, test_py: str) -> tuple[bool, str]:
         # 2. Build the container image from the .def file
         # ------------------------------------------------------------------
         sif_path = td_path / "img.sif"
-        build_rc = subprocess.run(["apptainer", "build", str(sif_path), str(def_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180).returncode
-        if build_rc:
-            print(f"Apptainer build failed: {build_rc}")
-            return False, "Apptainer build failed"
+        build_proc = subprocess.run(
+            ["apptainer", "build", str(sif_path), str(def_path)],
+            capture_output=True, text=True, timeout=180,
+        )
+        if build_proc.returncode:
+            err_tail = (build_proc.stderr or build_proc.stdout or "").strip()[-500:]
+            print(f"Apptainer build failed (rc={build_proc.returncode}): {err_tail}")
+            return False, f"Apptainer build failed (rc={build_proc.returncode}): {err_tail}"
 
         # copy the test file to the container at /home/agent/test_initial_state.py
         # shutil.copy(test_file, td_path / "home" / "agent" / "test_initial_state.py")
@@ -141,17 +145,35 @@ def parse_def_template(def_template: str) -> str:
     the definition. Finally, common leading indentation is removed so the
     template can be written directly to disk.
     """
-    # Normalise line endings and trim outer whitespace
-    cleaned = def_template.replace("\r\n", "\n").strip()
+    from generator import strip_thinking_tags
 
-    # Attempt to extract the first fenced code block
+    cleaned = strip_thinking_tags(def_template).replace("\r\n", "\n").strip()
+
     fence_re = re.compile(r"```(?:[a-zA-Z0-9_-]+)?\n(?P<code>[\s\S]*?)```", re.MULTILINE)
     match = fence_re.search(cleaned)
     if match:
         cleaned = match.group("code").strip()
 
-    # Remove any common leading indentation
     cleaned = textwrap.dedent(cleaned).strip()
+
+    # Normalize Bootstrap/From to always use localimage with the expected
+    # relative SIF path.  The LLM sometimes hallucinates absolute paths,
+    # Docker references, or wrong bootstrap types.
+    cleaned = re.sub(
+        r"^Bootstrap:.*$",
+        "Bootstrap: localimage",
+        cleaned,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    cleaned = re.sub(
+        r"^From:.*$",
+        "From: ./ubuntu_22.04.sif",
+        cleaned,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
     return cleaned
 
 def iterate_def_template_batch(
@@ -161,11 +183,15 @@ def iterate_def_template_batch(
     temperature: float = 0.6,
     max_tokens: int = 2048,
     max_concurrency: int = 64,
+    validate: bool = True,
 ) -> List[Optional[str]]:
-    """Batched single-shot def generation followed by parallel build/test.
+    """Batched single-shot def generation followed by optional parallel build/test.
 
     items: list of (task_description, truth, test_py)
-    Returns list aligned with input: the first passing def text per item, or None if fails.
+    validate: if True, build each def with Apptainer and run the initial-state
+              tests inside the container.  If False, just parse and return the
+              def text without building.
+    Returns list aligned with input: the def text per item, or None on failure.
     """
 
     messages: list[list[dict[str, str]]] = []
@@ -190,22 +216,33 @@ def iterate_def_template_batch(
         max_concurrency=max_concurrency,
     )
 
-    # Prepare results aligned with input order
     results: List[Optional[str]] = [None] * len(items)
 
     def worker(index: int, item: Tuple[str, str, str], resp_obj) -> Tuple[int, Optional[str]]:
         try:
             if resp_obj is None:
+                print(f"[def {index}] LLM response is None")
                 return index, None
             content = resp_obj.choices[0].message.content
+            if not content:
+                print(f"[def {index}] LLM returned empty content")
+                return index, None
             def_text = parse_def_template(content)
-            _task_description, _truth, test_py = item
-            ok, _ = build_and_test(def_text, test_py)
-            return index, (def_text if ok else None)
-        except Exception:
+            if not def_text or not def_text.strip():
+                print(f"[def {index}] Parsed def is empty (model may have only produced thinking)")
+                return index, None
+            if validate:
+                _task_description, _truth, test_py = item
+                ok, output = build_and_test(def_text, test_py)
+                if not ok:
+                    print(f"[def {index}] Build/test failed: {output[:200]}")
+                return index, (def_text if ok else None)
+            else:
+                return index, def_text
+        except Exception as e:
+            print(f"[def {index}] Worker exception: {e}")
             return index, None
 
-    # Submit parallel build/test tasks
     futures = []
     with ThreadPoolExecutor(max_workers=64) as executor:
         for idx, (item, resp) in enumerate(zip(items, responses)):

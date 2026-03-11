@@ -134,6 +134,18 @@ def chat_completion_batch(
     return results
 
 
+def strip_thinking_tags(text: str) -> str:
+    """Remove ``<think>...</think>`` blocks emitted by reasoning models.
+
+    Also handles truncated thinking blocks where ``</think>`` is missing
+    (e.g. the model hit the token limit while still reasoning).
+    """
+    import re
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text)
+    text = re.sub(r"<think>[\s\S]*", "", text)
+    return text.strip()
+
+
 def parse_python_code(code: str) -> str:
     """Extract the raw Python code from an LLM response string.
 
@@ -144,16 +156,13 @@ def parse_python_code(code: str) -> str:
     to a ``.py`` file.
     """
     import re
-    # First, look for a fenced code block – we assume the first one contains
-    # the pytest file we are interested in.
-    fence_regex = re.compile(r"```(?:python)?\n(.*?)```", re.DOTALL | re.IGNORECASE)
+    code = strip_thinking_tags(code)
+    fence_regex = re.compile(r"```(?:python|py|Python)?\s*\n(.*?)```", re.DOTALL)
     match = fence_regex.search(code)
     if match:
         snippet = match.group(1)
     else:
-        # Fallback – treat the whole string as code.
         snippet = code
-    # Normalise indentation & strip trailing whitespace/newlines
     return textwrap.dedent(snippet).rstrip()  # type: ignore[arg-type]
 
 def check_python_code(code: str) -> bool:
@@ -161,8 +170,10 @@ def check_python_code(code: str) -> bool:
     try:
         compile(code, "<string>", "exec")
         return True
-    except SyntaxError:
+    except SyntaxError as e:
+        print(f"Syntax error: {e}")
         return False
     except Exception as e:
+        print(f"Error: {e}")
         return False
 

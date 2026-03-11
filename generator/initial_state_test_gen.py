@@ -69,7 +69,12 @@ def generate_test_templates_batch(
             results.append(None)
             continue
         try:
-            content = textwrap.dedent(resp.choices[0].message.content)
+            choice = resp.choices[0]
+            if choice.finish_reason == "length":
+                print("Initial test template truncated (hit max_tokens limit)")
+                results.append(None)
+                continue
+            content = textwrap.dedent(choice.message.content)
             parsed = parse_python_code(content)
             if check_python_code(parsed):
                 results.append(parsed)

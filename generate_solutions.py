@@ -40,33 +40,80 @@ class SolutionConfig:
     use_parquet: bool = False
 
 
+def _resolve_base_sif(def_path: Path) -> Optional[Path]:
+    """Find the ubuntu_22.04.sif base image relative to the def or project root."""
+    candidates = [
+        def_path.parent / "ubuntu_22.04.sif",
+        Path(__file__).resolve().parent / "ubuntu_22.04.sif",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c.resolve()
+    return None
+
+
+def _patch_def_text(def_text: str, def_path: Path) -> str:
+    """Patch a def file's Bootstrap/From lines and ensure /home/user permissions."""
+    import re
+
+    base_sif = _resolve_base_sif(def_path)
+    if base_sif:
+        def_text = re.sub(
+            r"^Bootstrap:.*$",
+            "Bootstrap: localimage",
+            def_text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        def_text = re.sub(
+            r"^From:.*$",
+            f"From: {base_sif}",
+            def_text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+
+    if "chmod 755 /home/user" not in def_text:
+        import re as _re
+        # Insert at the end of %post, right before the next section header
+        def_text = _re.sub(
+            r"(%post\b.*?)((?=\n%[a-z])|\Z)",
+            r"\1\n    chmod 755 /home/user\n",
+            def_text,
+            count=1,
+            flags=_re.DOTALL,
+        )
+
+    return def_text
+
+
 def build_and_test(
     sif_path: Path, def_path: Path, test_py: str, run_initial_tests: bool = True
 ) -> tuple[bool, str]:
     """Build container and optionally run initial tests."""
+    import tempfile
+
     with open(def_path, "r") as f:
         def_text = f.read()
 
-    if "chmod 755 /home/user" not in def_text:
-        # Add chmod 755 /home/user to the end of the %post section
-        def_lines = [line for line in def_text.split("\n") if "%" in line]
-        post_idx = [i for i, line in enumerate(def_lines) if "post" in line.lower()]
-        next_section_header = def_lines[post_idx[0] + 1]
-        def_text = def_text.replace(
-            next_section_header, next_section_header + "\n    chmod 755 /home/user\n"
-        )
-        with open(def_path, "w") as f:
-            f.write(def_text)
+    def_text = _patch_def_text(def_text, def_path)
 
-    build_rc = subprocess.run(
-        ["apptainer", "build", str(sif_path), str(def_path)],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    ).returncode
-    if build_rc:
-        print(f"Apptainer build failed: {build_rc}")
-        return False, "Apptainer build failed"
+    patched = Path(tempfile.mktemp(suffix=".def"))
+    patched.write_text(def_text)
+
+    try:
+        build_proc = subprocess.run(
+            ["apptainer", "build", str(sif_path), str(patched)],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if build_proc.returncode:
+            err = (build_proc.stderr or build_proc.stdout or "").strip()[-500:]
+            print(f"Apptainer build failed: {err}")
+            return False, f"Apptainer build failed: {err}"
+    finally:
+        patched.unlink(missing_ok=True)
 
     if not run_initial_tests:
         return True, ""
@@ -253,19 +300,26 @@ def main():
     def process_task_with_retry(task_dir: str, cfg: SolutionConfig):
         """Wrap per-task retry logic so it can run in parallel."""
         task_dir = Path(task_dir)
-        max_retries = 1
+        max_retries = 2
         result = None
 
-        while max_retries > 0:
-            result = process_task(task_dir, cfg)
+        for attempt in range(max_retries):
+            try:
+                result = process_task(task_dir, cfg)
+            except Exception as e:
+                print(f"[{task_dir.name}] Attempt {attempt + 1}/{max_retries} failed with exception: {e}")
+                result = None
+
             if result is None:
-                print(f"Retrying task {task_dir.name}...")
-                max_retries -= 1
+                if attempt < max_retries - 1:
+                    print(f"[{task_dir.name}] Retrying...")
+                else:
+                    print(f"[{task_dir.name}] All {max_retries} attempts failed, skipping.")
             elif result in ("no def", "no sif", "no initial test"):
-                print(f"No def, sif, or initial test for task {task_dir.name}, skipping.")
+                print(f"[{task_dir.name}] Missing files ({result}), skipping.")
                 break
             else:
-                print(f"Pass@k: {result} for task {task_dir.name}")
+                print(f"[{task_dir.name}] Pass@k: {result}")
                 break
 
         return task_dir, result

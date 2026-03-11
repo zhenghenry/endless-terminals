@@ -30,12 +30,13 @@ class PipelineConfig:
     num_solutions: int = 256
     max_actions: int = 20
     model: str = "qwen/qwen-3-32b"
-    max_tokens: int = 1024
+    max_tokens: int = 4096
     task_temperature: float = 1.0
     test_temperature: float = 0.6
     solution_temperature: float = 1.0
     parallel_jobs: int = 1
     verbose: bool = False
+    validate_defs: bool = True
 
 
 def _safe_write_text(path: Path, content: str) -> None:
@@ -169,6 +170,7 @@ def _generate_batch(cfg: AsyncBatchConfig, batch_count: int) -> List[Optional[Pa
         temperature=cfg.test_temperature,
         max_tokens=cfg.max_tokens,
         max_concurrency=min(64, cfg.max_concurrency),
+        validate=cfg.validate_defs,
     )
 
     valid_indices = [i for i, def_text in enumerate(def_candidates) if def_text]
@@ -252,9 +254,12 @@ def parse_args(argv: Optional[List[str]] = None) -> AsyncBatchConfig:
     ap.add_argument("--model", type=str, default="gpt-4o")
     ap.add_argument("--task-temperature", type=float, default=1.0)
     ap.add_argument("--test-temperature", type=float, default=0.6)
+    ap.add_argument("--max-tokens", type=int, default=4096)
     ap.add_argument("--solution-temperature", type=float, default=1.0)
     ap.add_argument("--batch-size", type=int, default=100)
     ap.add_argument("--max-concurrency", type=int, default=128)
+    ap.add_argument("--skip-def-validation", action="store_true",
+                     help="Skip Apptainer build/test validation of generated .def files")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--quiet", action="store_true")
 
@@ -266,11 +271,13 @@ def parse_args(argv: Optional[List[str]] = None) -> AsyncBatchConfig:
         num_tasks=args.num_tasks,
         out_dir=args.out_dir,
         model=args.model,
+        max_tokens=args.max_tokens,
         task_temperature=args.task_temperature,
         test_temperature=args.test_temperature,
         solution_temperature=args.solution_temperature,
         parallel_jobs=1,
         verbose=verbose,
+        validate_defs=not args.skip_def_validation,
         batch_size=max(1, args.batch_size),
         max_concurrency=max(1, args.max_concurrency),
     )

@@ -100,19 +100,25 @@ def run_n_solutions(
     envs: List[ContainerEnvironment] = []
     try:
         start_time = time.time()
+        max_init_retries = 3
+
         def _init_env(i: int) -> ContainerEnvironment:
-            env = ContainerEnvironment(
-                container_sif_path=container_sif_path,
-                initial_test_path=initial_test_path,
-                final_test_path=final_test_path,
-                def_path=def_path,
-                max_actions=max_actions,
-                verbose=verbose,
-            )
-            ok = env.initialize(run_initial_tests=False)
-            if not ok:
-                raise RuntimeError(f"Failed to initialize environment #{i}")
-            return env
+            for attempt in range(max_init_retries):
+                env = ContainerEnvironment(
+                    container_sif_path=container_sif_path,
+                    initial_test_path=initial_test_path,
+                    final_test_path=final_test_path,
+                    def_path=def_path,
+                    max_actions=max_actions,
+                    verbose=verbose,
+                )
+                ok = env.initialize(run_initial_tests=False)
+                if ok:
+                    return env
+                env.cleanup()
+                if attempt < max_init_retries - 1:
+                    time.sleep(1 * (attempt + 1))
+            raise RuntimeError(f"Failed to initialize environment #{i} after {max_init_retries} attempts")
 
         with ThreadPoolExecutor(max_workers=num_pool_workers) as executor:
             envs = list(executor.map(_init_env, range(num_solutions)))

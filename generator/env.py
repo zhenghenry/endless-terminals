@@ -530,30 +530,65 @@ class InteractiveContainerEnvironment:
         """Rebuild sif from def."""
         with open(self.def_path, "r") as f:
             def_text = f.read()
-        def_text = def_text.replace("./ubuntu_22.04.sif", "/data/v-kangandhi/endless/ubuntu_22.04.sif")
-        with open(self.def_path, "w") as f:
-            f.write(def_text)
+
+        # Resolve the base SIF to an absolute path so the build works
+        # regardless of CWD.  Search next to the def file, in the project
+        # root, and in common locations.
+        base_sif = None
+        candidates = [
+            self.def_path.parent / "ubuntu_22.04.sif",
+            Path(__file__).resolve().parent.parent / "ubuntu_22.04.sif",
+        ]
+        for c in candidates:
+            if c.exists():
+                base_sif = str(c.resolve())
+                break
+
+        if base_sif:
+            import re as _re
+            def_text = _re.sub(
+                r"^Bootstrap:.*$",
+                "Bootstrap: localimage",
+                def_text,
+                count=1,
+                flags=_re.MULTILINE,
+            )
+            def_text = _re.sub(
+                r"^From:.*$",
+                f"From: {base_sif}",
+                def_text,
+                count=1,
+                flags=_re.MULTILINE,
+            )
 
         if "chmod 755 /home/user" not in def_text:
-            # Add chmod 755 /home/user to the end of the %post section
-            def_lines = [line for line in def_text.split("\n") if "%" in line]
-            post_idx = [i for i, line in enumerate(def_lines) if "post" in line.lower()]
-            next_section_header = def_lines[post_idx[0] + 1]
-            def_text = def_text.replace(
-                next_section_header, next_section_header + "\n    chmod 755 /home/user\n"
+            import re as _re2
+            def_text = _re2.sub(
+                r"(%post\b.*?)((?=\n%[a-z])|\Z)",
+                r"\1\n    chmod 755 /home/user\n",
+                def_text,
+                count=1,
+                flags=_re2.DOTALL,
             )
-            with open(self.def_path, "w") as f:
-                f.write(def_text)
 
-        build_rc = subprocess.run(
-            ["apptainer", "build", str(self.sif_path), str(self.def_path)],
-            capture_output=True,
-            text=True,
-        )
-        if build_rc.returncode != 0:
-            print(f"Apptainer build failed: {build_rc.stdout + build_rc.stderr}")
-            return False
-        return build_rc.returncode == 0
+        # Write a patched copy to a temp file so we don't corrupt the
+        # original def (which may be read-only or shared).
+        import tempfile as _tmpmod
+        patched = Path(_tmpmod.mktemp(suffix=".def"))
+        patched.write_text(def_text)
+
+        try:
+            build_rc = subprocess.run(
+                ["apptainer", "build", str(self.sif_path), str(patched)],
+                capture_output=True,
+                text=True,
+            )
+            if build_rc.returncode != 0:
+                print(f"Apptainer build failed: {build_rc.stdout + build_rc.stderr}")
+                return False
+            return True
+        finally:
+            patched.unlink(missing_ok=True)
 
     def get_prompt(self) -> str:
         """Get the current shell prompt showing the working directory."""

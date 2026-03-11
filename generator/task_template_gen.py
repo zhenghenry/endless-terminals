@@ -10,7 +10,7 @@ import sys
 
 sys.path.insert(0, str(Path().resolve()))
 
-from generator import chat_completion_batch
+from generator import chat_completion_batch, strip_thinking_tags
 
 SYSTEM_MSG = """You are creating realistic Linux-terminal tasks for training an AI agent.
 
@@ -255,8 +255,8 @@ def generate_templates_batch(
 
 def parse_template(raw: str) -> dict:
     """Convert the raw XML *raw* into a structured ``dict``."""
+    raw = strip_thinking_tags(raw)
 
-    # Extract the task description template
     template = re.search(r"<task>(.*?)</task>", raw, re.DOTALL).group(1).strip()
     if not template:
         raise ValueError("No task description found in the response.")

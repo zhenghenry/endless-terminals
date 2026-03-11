@@ -82,16 +82,24 @@ def generate_test_templates_batch(
     results: list[Optional[str]] = []
     for resp in responses:
         if resp is None:
+            print("Response is None")
             results.append(None)
             continue
         try:
-            content = textwrap.dedent(resp.choices[0].message.content)
+            choice = resp.choices[0]
+            if choice.finish_reason == "length":
+                print("Test template truncated (hit max_tokens limit)")
+                results.append(None)
+                continue
+            content = textwrap.dedent(choice.message.content)
             parsed = parse_python_code(content)
             if check_python_code(parsed):
                 results.append(parsed)
             else:
+                print("Test template is not valid")
                 results.append(None)
-        except Exception:
+        except Exception as e:
+            print(f"Error parsing test template: {e}")
             results.append(None)
     return results
 
