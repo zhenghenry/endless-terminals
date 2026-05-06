@@ -14,6 +14,10 @@ import asyncio
 from tqdm import tqdm
 
 
+from generator.apptainer_build import (
+    format_apptainer_build_error,
+    run_apptainer_build,
+)
 from generator.task_template_gen import generate_templates_batch
 from generator.initial_state_test_gen import generate_test_templates_batch as generate_initial_tests_batch
 from generator.apptainer_def_gen import iterate_def_template_batch
@@ -47,15 +51,40 @@ def _safe_write_text(path: Path, content: str) -> None:
 def _build_sif(def_path: Path, sif_path: Path) -> bool:
     sif_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        # build_rc = subprocess.run(["apptainer", "build", str(sif_path), str(def_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180).returncode
-
-        rc = subprocess.run(["apptainer", "build", str(sif_path), str(def_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
-        return rc == 0
+        build_proc = run_apptainer_build(sif_path, def_path, timeout=180)
+        if build_proc.returncode != 0:
+            print(
+                format_apptainer_build_error(
+                    sif_path=sif_path,
+                    def_path=def_path,
+                    returncode=build_proc.returncode,
+                    stdout=build_proc.stdout,
+                    stderr=build_proc.stderr,
+                )
+            )
+            return False
+        return True
     except FileNotFoundError:
         # apptainer not installed / not on PATH
+        print(
+            format_apptainer_build_error(
+                sif_path=sif_path,
+                def_path=def_path,
+                error=FileNotFoundError("apptainer executable not found"),
+            )
+        )
         return False
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         # SIF build timed out
+        print(
+            format_apptainer_build_error(
+                sif_path=sif_path,
+                def_path=def_path,
+                error=exc,
+                stdout=exc.stdout or "",
+                stderr=exc.stderr or "",
+            )
+        )
         return False
 
 def _format_task_dir(base: Path, idx: int, width: int = 6) -> Path:

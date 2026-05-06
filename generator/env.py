@@ -18,7 +18,56 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from generator.apptainer_build import (
+    format_apptainer_build_error,
+    run_apptainer_build,
+)
+
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")  # Strip ANSI escapes
+
+_dbus_setup_lock = threading.Lock()
+_dbus_pid: Optional[int] = None
+
+
+def _ensure_dbus_session() -> None:
+    """Start a dbus session daemon if one isn't available for the current user.
+
+    Apptainer 1.4+ on cgroups v2 requires a dbus session bus to manage
+    cgroups for rootless instances.  Non-login sessions (SSH, service
+    accounts) often lack one.
+    """
+    global _dbus_pid
+    with _dbus_setup_lock:
+        uid = os.getuid()
+        default_sock = f"/run/user/{uid}/bus"
+
+        # Already available via the standard path
+        if os.path.exists(default_sock):
+            if "DBUS_SESSION_BUS_ADDRESS" not in os.environ:
+                os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={default_sock}"
+            return
+
+        # Already set up by us in a previous call
+        addr = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+        if addr and os.path.exists(addr.replace("unix:path=", "")):
+            return
+
+        # Start a private dbus-daemon with a temp socket
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/tmp/apptainer-dbus-{uid}")
+        os.makedirs(runtime_dir, exist_ok=True)
+        sock_path = os.path.join(runtime_dir, "bus")
+
+        try:
+            proc = subprocess.run(
+                ["dbus-daemon", "--session", f"--address=unix:path={sock_path}",
+                 "--fork", "--print-pid"],
+                capture_output=True, text=True,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                _dbus_pid = int(proc.stdout.strip())
+                os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={sock_path}"
+        except FileNotFoundError:
+            pass
 
 
 class InteractiveContainerEnvironment:
@@ -197,11 +246,7 @@ class InteractiveContainerEnvironment:
             # Give shell a brief moment to start up
             time.sleep(0.05)
             if self.shell_process.poll() is not None:
-                if self.verbose:
-                    print("Apptainer shell exited early with code:", self.shell_process.returncode)
-                leftover = self._drain_queue()
-                if leftover:
-                    print("Shell start output:\n", leftover)
+                self._drain_queue()
                 return False
 
             # Initialize shell: make it predictable
@@ -215,19 +260,11 @@ class InteractiveContainerEnvironment:
             os.write(self.master_fd, (init_script + "\n").encode("utf-8"))
             _, code = self._read_until_marker(timeout=10.0)
             if code is None:
-                if self.verbose:
-                    print("Shell init timed out.")
                 return False
 
-            if self.verbose:
-                init_out = self._drain_queue()
-                if init_out:
-                    print(f"Shell started. Initial output:\n{init_out}")
-
+            self._drain_queue()
             return True
-        except Exception as e:
-            if self.verbose:
-                print(f"Failed to start shell: {e}")
+        except Exception:
             return False
 
     def _stop_shell(self):
@@ -289,22 +326,15 @@ class InteractiveContainerEnvironment:
 
     def initialize(self, run_initial_tests: bool = True) -> bool:
         """Initialize the container environment and validate initial state."""
-        if self.verbose:
-            print(f"🔧 Initializing container environment with {self.sif_path.name}...")
-
         if not self.sif_path.exists():
-            if self.verbose:
-                print(f"⚠️  SIF not found at {self.sif_path}, attempting to build...")
             if self.def_path.exists():
                 self.build_container()
             else:
-                print("❌ Neither SIF nor def file exists")
                 return False
 
-        # Create temporary directory for test files (on host)
         self.temp_dir = Path(tempfile.mkdtemp(prefix="agent_env_")).resolve()
+        _ensure_dbus_session()
 
-        # Start a long-lived Apptainer instance
         self.instance_name = f"agent_{uuid.uuid4().hex[:8]}"
         start_cmd = [
             "apptainer", "instance", "start",
@@ -315,38 +345,20 @@ class InteractiveContainerEnvironment:
             str(self.sif_path),
             self.instance_name,
         ]
-        if self.verbose:
-            print(f"🔧 Starting instance with command: {' '.join(start_cmd)}")
         start_proc = subprocess.run(start_cmd, capture_output=True, text=True)
         if start_proc.returncode != 0:
-            if self.verbose:
-                print(f"❌ Instance start failed: {start_proc.stdout + start_proc.stderr}")
             return False
-        else:
-            if self.verbose:
-                print(f"✅ Instance started: {start_proc.stdout + start_proc.stderr}")
 
-        # Start the interactive shell
         if not self._start_shell():
-            if self.verbose:
-                print("❌ Failed to start interactive shell")
             self._stop_instance()
             return False
-        else:
-            if self.verbose:
-                print("✅ Interactive shell started")
 
-        # Run initial tests if requested
         if run_initial_tests:
             if not self.run_initial_tests():
-                if self.verbose:
-                    print("❌ Initial state tests failed")
                 self._stop_shell()
                 self._stop_instance()
                 return False
 
-        if self.verbose:
-            print("✅ Container environment ready")
         self.exec("cd /home/user")
         return True
 
@@ -364,16 +376,11 @@ class InteractiveContainerEnvironment:
 
         # Check if shell process is still alive
         if self.shell_process.poll() is not None:
-            if self.verbose:
-                print(f"⚠️  Shell process died (exit code: {self.shell_process.returncode}), restarting...")
             self.shell_process = None
             if not self._start_shell():
                 return False, "Shell process died and restart failed"
 
-        # Check if reader thread is still alive
         if not self.reader_thread or not self.reader_thread.is_alive():
-            if self.verbose:
-                print("⚠️  Reader thread died, restarting shell...")
             self._stop_shell()
             if not self._start_shell():
                 return False, "Reader thread died and shell restart failed"
@@ -402,8 +409,6 @@ class InteractiveContainerEnvironment:
         
         # Handle timeout
         if code is None:
-            if self.verbose:
-                print(f"⚠️  Command timed out after {timeout or self.read_timeout}s")
             return False, f"Command timed out. Partial output:\n{raw_out[:500]}"
         
         # Clean output: strip ANSI, strip echoed lines (PTY has no echo, but some programs add it)
@@ -415,106 +420,43 @@ class InteractiveContainerEnvironment:
 
     def run_initial_tests(self) -> bool:
         """Run initial state validation tests."""
-        if self.verbose:
-            print("🧪 Running initial state tests...")
-
         with open(self.initial_test_path, "r") as f:
             test_file_text = f.read()
 
         test_path_in_container = "/home/user/test_initial.py"
+        marker = f"EOF_TEST_FILE_{uuid.uuid4().hex}"
+        write_cmd = (
+            f"cat <<'{marker}' > {test_path_in_container}\n"
+            f"{test_file_text}\n"
+            f"{marker}\n"
+        )
 
-        # Write test file with retry logic
-        max_retries = 1
-        retry_delay = 0.1
+        success, output = self.exec(write_cmd)
+        if not success:
+            return False
 
-        for attempt in range(max_retries):
-            marker = f"EOF_TEST_FILE_{uuid.uuid4().hex}"
-            write_cmd = (
-                f"cat <<'{marker}' > {test_path_in_container}\n"
-                f"{test_file_text}\n"
-                f"{marker}\n"
-            )
-
-            success, output = self.exec(write_cmd)
-            if success:
-                break
-
-            if self.verbose:
-                print(f"⚠️  Write attempt {attempt + 1}/{max_retries} failed: {output[:100]}")
-
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-                retry_delay *= 2
-            else:
-                if self.verbose:
-                    print(f"❌ Failed to write test file after {max_retries} attempts: {output}")
-                return False
-
-        # Run pytest on the file inside the instance
         test_success, test_output = self.exec(f"pytest -q {test_path_in_container}")
-
-        # Clean up the test file from the instance
         self.exec(f"rm -f {test_path_in_container}")
-
-        if not test_success:
-            if self.verbose:
-                print(f"Initial test output:\n{test_output}")
-        else:
-            if self.verbose:
-                print("✅ Initial state tests passed")
-        
         return test_success
 
     def run_final_tests(self) -> Tuple[bool, str]:
         """Run final state validation tests inside the instance."""
-        if self.verbose:
-            print("🧪 Running final state tests...")
-
         with open(self.final_test_path, "r") as f:
             test_file_text = f.read()
 
         test_path_in_container = "/home/user/test_final.py"
+        marker = f"EOF_TEST_FILE_{uuid.uuid4().hex}"
+        write_cmd = (
+            f"cat <<'{marker}' > {test_path_in_container}\n"
+            f"{test_file_text}\n"
+            f"{marker}\n"
+        )
+        ok, write_out = self.exec(write_cmd)
+        if not ok:
+            return False, write_out
 
-        # Write test file with retry logic
-        max_retries = 1
-        retry_delay = 0.1
-
-        for attempt in range(max_retries):
-            marker = f"EOF_TEST_FILE_{uuid.uuid4().hex}"
-            write_cmd = (
-                f"cat <<'{marker}' > {test_path_in_container}\n"
-                f"{test_file_text}\n"
-                f"{marker}\n"
-            )
-            ok, write_out = self.exec(write_cmd)
-
-            if ok:
-                break
-
-            if self.verbose:
-                print(f"⚠️  Write attempt {attempt + 1}/{max_retries} failed: {write_out[:100]}")
-
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-                retry_delay *= 2
-            else:
-                if self.verbose:
-                    print(f"❌ Failed to write final test file after {max_retries} attempts: {write_out}")
-                return False, write_out
-
-        # Run pytest inside the instance
         test_success, test_output = self.exec(f"pytest -q {test_path_in_container}")
-
-        # Clean up test file
         self.exec(f"rm -f {test_path_in_container}")
-
-        if self.verbose:
-            if test_success:
-                print("✅ Final state tests passed!")
-            else:
-                print("❌ Final state tests failed")
-                print(test_output)
-
         return test_success, test_output
 
     def cleanup(self):
@@ -523,8 +465,6 @@ class InteractiveContainerEnvironment:
         if self.temp_dir and self.temp_dir.exists():
             shutil.rmtree(self.temp_dir, ignore_errors=True)
         self._stop_instance()
-        if self.verbose:
-            print("🧹 Cleaned up temporary files and processes")
 
     def build_container(self):
         """Rebuild sif from def."""
@@ -578,15 +518,39 @@ class InteractiveContainerEnvironment:
         patched.write_text(def_text)
 
         try:
-            build_rc = subprocess.run(
-                ["apptainer", "build", str(self.sif_path), str(patched)],
-                capture_output=True,
-                text=True,
-            )
+            build_rc = run_apptainer_build(self.sif_path, patched)
             if build_rc.returncode != 0:
-                print(f"Apptainer build failed: {build_rc.stdout + build_rc.stderr}")
+                print(
+                    format_apptainer_build_error(
+                        sif_path=self.sif_path,
+                        def_path=patched,
+                        returncode=build_rc.returncode,
+                        stdout=build_rc.stdout,
+                        stderr=build_rc.stderr,
+                    )
+                )
                 return False
             return True
+        except FileNotFoundError as exc:
+            print(
+                format_apptainer_build_error(
+                    sif_path=self.sif_path,
+                    def_path=patched,
+                    error=exc,
+                )
+            )
+            return False
+        except subprocess.TimeoutExpired as exc:
+            print(
+                format_apptainer_build_error(
+                    sif_path=self.sif_path,
+                    def_path=patched,
+                    error=exc,
+                    stdout=exc.stdout or "",
+                    stderr=exc.stderr or "",
+                )
+            )
+            return False
         finally:
             patched.unlink(missing_ok=True)
 

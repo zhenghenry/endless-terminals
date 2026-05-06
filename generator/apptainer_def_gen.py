@@ -17,6 +17,10 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path().resolve()))
 
 from generator import chat_completion_batch
+from generator.apptainer_build import (
+    format_apptainer_build_error,
+    run_apptainer_build,
+)
 
 SYSTEM_MSG = """ You are an expert in Apptainer/Singularity.
 You are given a task description and will be tested so that the initial state of the container is set up in a way that an agent can be tested on the task.
@@ -87,14 +91,39 @@ def build_and_test(def_template: str, test_py: str) -> tuple[bool, str]:
         # 2. Build the container image from the .def file
         # ------------------------------------------------------------------
         sif_path = td_path / "img.sif"
-        build_proc = subprocess.run(
-            ["apptainer", "build", str(sif_path), str(def_path)],
-            capture_output=True, text=True, timeout=180,
-        )
+        try:
+            build_proc = run_apptainer_build(sif_path, def_path, cwd=td_path, timeout=180)
+        except FileNotFoundError as exc:
+            err = format_apptainer_build_error(
+                sif_path=sif_path,
+                def_path=def_path,
+                error=exc,
+                cwd=td_path,
+            )
+            print(err)
+            return False, err
+        except subprocess.TimeoutExpired as exc:
+            err = format_apptainer_build_error(
+                sif_path=sif_path,
+                def_path=def_path,
+                error=exc,
+                stdout=exc.stdout or "",
+                stderr=exc.stderr or "",
+                cwd=td_path,
+            )
+            print(err)
+            return False, err
         if build_proc.returncode:
-            err_tail = (build_proc.stderr or build_proc.stdout or "").strip()[-500:]
-            print(f"Apptainer build failed (rc={build_proc.returncode}): {err_tail}")
-            return False, f"Apptainer build failed (rc={build_proc.returncode}): {err_tail}"
+            err = format_apptainer_build_error(
+                sif_path=sif_path,
+                def_path=def_path,
+                returncode=build_proc.returncode,
+                stdout=build_proc.stdout,
+                stderr=build_proc.stderr,
+                cwd=td_path,
+            )
+            print(err)
+            return False, err
 
         # copy the test file to the container at /home/agent/test_initial_state.py
         # shutil.copy(test_file, td_path / "home" / "agent" / "test_initial_state.py")
@@ -221,26 +250,20 @@ def iterate_def_template_batch(
     def worker(index: int, item: Tuple[str, str, str], resp_obj) -> Tuple[int, Optional[str]]:
         try:
             if resp_obj is None:
-                print(f"[def {index}] LLM response is None")
                 return index, None
             content = resp_obj.choices[0].message.content
             if not content:
-                print(f"[def {index}] LLM returned empty content")
                 return index, None
             def_text = parse_def_template(content)
             if not def_text or not def_text.strip():
-                print(f"[def {index}] Parsed def is empty (model may have only produced thinking)")
                 return index, None
             if validate:
                 _task_description, _truth, test_py = item
                 ok, output = build_and_test(def_text, test_py)
-                if not ok:
-                    print(f"[def {index}] Build/test failed: {output[:200]}")
                 return index, (def_text if ok else None)
             else:
                 return index, def_text
-        except Exception as e:
-            print(f"[def {index}] Worker exception: {e}")
+        except Exception:
             return index, None
 
     futures = []

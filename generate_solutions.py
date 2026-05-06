@@ -16,6 +16,10 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from generate_tasks import _safe_write_text
+from generator.apptainer_build import (
+    format_apptainer_build_error,
+    run_apptainer_build,
+)
 from generator.sample_solutions import run_n_solutions
 
 
@@ -102,16 +106,35 @@ def build_and_test(
     patched.write_text(def_text)
 
     try:
-        build_proc = subprocess.run(
-            ["apptainer", "build", str(sif_path), str(patched)],
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
+        build_proc = run_apptainer_build(sif_path, patched, timeout=180)
         if build_proc.returncode:
-            err = (build_proc.stderr or build_proc.stdout or "").strip()[-500:]
-            print(f"Apptainer build failed: {err}")
-            return False, f"Apptainer build failed: {err}"
+            err = format_apptainer_build_error(
+                sif_path=sif_path,
+                def_path=patched,
+                returncode=build_proc.returncode,
+                stdout=build_proc.stdout,
+                stderr=build_proc.stderr,
+            )
+            print(err)
+            return False, err
+    except FileNotFoundError as exc:
+        err = format_apptainer_build_error(
+            sif_path=sif_path,
+            def_path=patched,
+            error=exc,
+        )
+        print(err)
+        return False, err
+    except subprocess.TimeoutExpired as exc:
+        err = format_apptainer_build_error(
+            sif_path=sif_path,
+            def_path=patched,
+            error=exc,
+            stdout=exc.stdout or "",
+            stderr=exc.stderr or "",
+        )
+        print(err)
+        return False, err
     finally:
         patched.unlink(missing_ok=True)
 
@@ -324,13 +347,24 @@ def main():
 
         return task_dir, result
 
-    if cfg.workers <= 1:
+    # Cap workers so total concurrent containers stays sane.
+    # Each worker runs num_solutions containers simultaneously.
+    max_total_instances = 32
+    effective_workers = max(1, min(cfg.workers, max_total_instances // max(1, cfg.num_solutions)))
+    if effective_workers != cfg.workers:
+        print(
+            f"Capping --workers from {cfg.workers} to {effective_workers} "
+            f"({effective_workers} × {cfg.num_solutions} solutions = "
+            f"{effective_workers * cfg.num_solutions} concurrent containers)"
+        )
+
+    if effective_workers <= 1:
         for task_dir in tqdm(task_dirs, desc="Processing Tasks"):
             process_task_with_retry(task_dir, cfg)
     else:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        with ThreadPoolExecutor(max_workers=cfg.workers) as executor:
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
             futures = {executor.submit(process_task_with_retry, td, cfg): td for td in task_dirs}
             with tqdm(total=len(task_dirs), desc="Processing Tasks") as pbar:
                 for fut in as_completed(futures):

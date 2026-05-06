@@ -18,6 +18,7 @@ vllm serve MiniMaxAI/MiniMax-M2.5 \
   --enable-auto-tool-choice \
   --dtype bfloat16 \
   --gpu-memory-utilization 0.75 \
+  --max-num-seqs 128 \
   --host 0.0.0.0 \
   --port 8000 \
   --seed 0

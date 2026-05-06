@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import threading
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from math import comb
@@ -18,6 +19,11 @@ from generator import chat_completion_batch
 from generator.env import InteractiveContainerEnvironment as ContainerEnvironment  
 
 MAX_OUTPUT_LENGTH = 50000
+
+# Global semaphore limiting concurrent Apptainer instance starts across all
+# tasks/workers.  Each start extracts the SIF with hundreds of threads, so
+# even a small number in parallel can exhaust system file descriptors.
+_APPTAINER_INIT_SEM = threading.Semaphore(2)
 SYSTEM_MESSAGE = """You are a highly capable Linux terminal agent operating strictly via a single-shell-command interface.
 Goal: Complete the user's task.
 
@@ -102,25 +108,40 @@ def run_n_solutions(
         start_time = time.time()
         max_init_retries = 3
 
+        # Build the SIF once before parallelizing instance starts.
+        sif_p = Path(container_sif_path)
+        if not sif_p.exists():
+            print(f"SIF not found at {sif_p}, building once before spawning instances...")
+            builder = ContainerEnvironment(
+                container_sif_path=container_sif_path,
+                initial_test_path=initial_test_path,
+                final_test_path=final_test_path,
+                def_path=def_path,
+                max_actions=max_actions,
+                verbose=verbose,
+            )
+            builder.build_container()
+
         def _init_env(i: int) -> ContainerEnvironment:
             for attempt in range(max_init_retries):
-                env = ContainerEnvironment(
-                    container_sif_path=container_sif_path,
-                    initial_test_path=initial_test_path,
-                    final_test_path=final_test_path,
-                    def_path=def_path,
-                    max_actions=max_actions,
-                    verbose=verbose,
-                )
-                ok = env.initialize(run_initial_tests=False)
+                with _APPTAINER_INIT_SEM:
+                    env = ContainerEnvironment(
+                        container_sif_path=container_sif_path,
+                        initial_test_path=initial_test_path,
+                        final_test_path=final_test_path,
+                        def_path=def_path,
+                        max_actions=max_actions,
+                        verbose=verbose,
+                    )
+                    ok = env.initialize(run_initial_tests=False)
                 if ok:
                     return env
                 env.cleanup()
                 if attempt < max_init_retries - 1:
-                    time.sleep(1 * (attempt + 1))
+                    time.sleep(2 * (attempt + 1))
             raise RuntimeError(f"Failed to initialize environment #{i} after {max_init_retries} attempts")
 
-        with ThreadPoolExecutor(max_workers=num_pool_workers) as executor:
+        with ThreadPoolExecutor(max_workers=num_solutions) as executor:
             envs = list(executor.map(_init_env, range(num_solutions)))
         end_time = time.time()
         print(f"environments initialized in {end_time - start_time} seconds")
